@@ -1,5 +1,5 @@
 #include "maxpool_layer.h"
-#include "cuda.h"
+#include "dark_cuda.h"
 #include "gemm.h"
 #include <stdio.h>
 
@@ -29,11 +29,11 @@ void cudnn_maxpool_setup(layer *l)
     maxpool_status = cudnnSetPooling2dDescriptor(
         l->poolingDesc,
         CUDNN_POOLING_MAX,
-        CUDNN_PROPAGATE_NAN,    // CUDNN_PROPAGATE_NAN, CUDNN_NOT_PROPAGATE_NAN
+        CUDNN_NOT_PROPAGATE_NAN,    // CUDNN_PROPAGATE_NAN, CUDNN_NOT_PROPAGATE_NAN
         l->size,
         l->size,
-        0, //l.pad,
-        0, //l.pad,
+        l->pad/2, //0, //l.pad,
+        l->pad/2, //0, //l.pad,
         l->stride,
         l->stride);
 
@@ -78,7 +78,7 @@ maxpool_layer make_maxpool_layer(int batch, int h, int w, int c, int size, int s
 
     #endif  // GPU
 	l.bflops = (l.size*l.size*l.c * l.out_h*l.out_w) / 1000000000.;
-    fprintf(stderr, "max          %d x %d / %d  %4d x%4d x%4d   ->  %4d x%4d x%4d %5.3f BF\n", size, size, stride, w, h, c, l.out_w, l.out_h, l.out_c, l.bflops);
+    fprintf(stderr, "max              %d x %d/%2d   %4d x%4d x%4d -> %4d x%4d x%4d %5.3f BF\n", size, size, stride, w, h, c, l.out_w, l.out_h, l.out_c, l.bflops);
     return l;
 }
 

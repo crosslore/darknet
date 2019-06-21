@@ -1,10 +1,10 @@
-#include "cuda_runtime.h"
-#include "curand.h"
-#include "cublas_v2.h"
+#include <cuda_runtime.h>
+#include <curand.h>
+#include <cublas_v2.h>
 #include <assert.h>
 
 #include "blas.h"
-#include "cuda.h"
+#include "dark_cuda.h"
 #include "utils.h"
 #include "tree.h"
 
@@ -414,6 +414,12 @@ __global__ void scal_kernel(int N, float ALPHA, float *X, int INCX)
     if(i < N) X[i*INCX] *= ALPHA;
 }
 
+__global__ void scal_add_kernel(int N, float ALPHA, float BETA, float *X, int INCX)
+{
+    int i = (blockIdx.x + blockIdx.y*gridDim.x) * blockDim.x + threadIdx.x;
+    if (i < N) X[i*INCX] = X[i*INCX] * ALPHA + BETA;
+}
+
 __global__ void fill_kernel(int N, float ALPHA, float *X, int INCX)
 {
     int i = (blockIdx.x + blockIdx.y*gridDim.x) * blockDim.x + threadIdx.x;
@@ -644,6 +650,12 @@ extern "C" void scal_ongpu(int N, float ALPHA, float * X, int INCX)
     CHECK_CUDA(cudaPeekAtLastError());
 }
 
+extern "C" void scal_add_ongpu(int N, float ALPHA, float BETA, float * X, int INCX)
+{
+    scal_add_kernel << <cuda_gridsize(N), BLOCK, 0, get_cuda_stream() >> >(N, ALPHA, BETA, X, INCX);
+    CHECK_CUDA(cudaPeekAtLastError());
+}
+
 extern "C" void supp_ongpu(int N, float ALPHA, float * X, int INCX)
 {
     supp_kernel<<<cuda_gridsize(N), BLOCK, 0, get_cuda_stream() >>>(N, ALPHA, X, INCX);
@@ -737,7 +749,9 @@ extern "C" void input_shortcut_gpu(float *in, int batch, int w1, int h1, int c1,
     if (sample < 1) sample = 1;
 
     int size = batch * minw * minh * minc;
-    input_shortcut_kernel << <cuda_gridsize(size), BLOCK, 0, get_cuda_stream() >> >(in, size, minw, minh, minc, stride, sample, batch, w1, h1, c1, add, w2, h2, c2, out);
+    //input_shortcut_kernel << <cuda_gridsize(size), BLOCK, 0, get_cuda_stream() >> >(in, size, minw, minh, minc, stride, sample, batch, w1, h1, c1, add, w2, h2, c2, out);
+    simple_copy_ongpu(w2 * h2 * c2 * batch, in, out);
+    shortcut_kernel << <cuda_gridsize(size), BLOCK, 0, get_cuda_stream() >> >(size, minw, minh, minc, stride, sample, batch, w1, h1, c1, add, w2, h2, c2, out);
     CHECK_CUDA(cudaPeekAtLastError());
 }
 
@@ -974,4 +988,160 @@ extern "C" void softmax_tree_gpu(float *input, int spatial, int batch, int strid
     CHECK_CUDA(cudaPeekAtLastError());
 	cuda_free((float *)tree_groups_size);
 	cuda_free((float *)tree_groups_offset);
+}
+
+
+__global__ void fix_nan_and_inf_kernel(float *input, size_t size)
+{
+    const int index = blockIdx.x*blockDim.x + threadIdx.x;
+    if (index < size) {
+        float val = input[index];
+        if (isnan(val) || isinf(val))
+            input[index] = 1.0f / index;  // pseudo random value
+    }
+}
+
+extern "C" void fix_nan_and_inf(float *input, size_t size)
+{
+    const int block_size = BLOCK;
+    const int num_blocks = get_number_of_blocks(size, block_size);
+    fix_nan_and_inf_kernel << <num_blocks, block_size, 0, get_cuda_stream() >> >(input, size);
+    CHECK_CUDA(cudaPeekAtLastError());
+    //CHECK_CUDA(cudaDeviceSynchronize());
+}
+
+
+__global__ void is_nan_or_inf_kernel(float *input, size_t size, int *pinned_return)
+{
+    const int index = blockIdx.x*blockDim.x + threadIdx.x;
+    if (index < size) {
+        float val = input[index];
+        if (isnan(val) || isinf(val))
+            *pinned_return = 1;
+    }
+}
+
+extern "C" int is_nan_or_inf(float *input, size_t size)
+{
+    int *pinned_return;
+    CHECK_CUDA(cudaHostAlloc(&pinned_return, sizeof(int), cudaHostRegisterMapped));
+    *pinned_return = 0;
+
+    const int block_size = BLOCK;
+    const int num_blocks = get_number_of_blocks(size, block_size);
+    is_nan_or_inf_kernel << <num_blocks, block_size, 0, get_cuda_stream() >> >(input, size, pinned_return);
+    CHECK_CUDA(cudaDeviceSynchronize());
+    int ret_val = *pinned_return;
+
+    CHECK_CUDA(cudaFreeHost(pinned_return));
+    return ret_val;
+}
+
+__global__ void add_3_arrays_activate_kernel(float *a1, float *a2, float *a3, size_t size, ACTIVATION a, float *dst)
+{
+    const int index = blockIdx.x*blockDim.x + threadIdx.x;
+    if (index < size) {
+        float val = 0;
+        val += a1[index];
+        val += a2[index];
+        if (a3) val += a3[index];
+        if (a == LOGISTIC) val = 1.f / (1.f + expf(-val));
+        else if(a == TANH) val = (2 / (1 + expf(-2 * val)) - 1);
+        dst[index] = val;
+    }
+}
+
+extern "C" void add_3_arrays_activate(float *a1, float *a2, float *a3, size_t size, ACTIVATION a, float *dst)
+{
+    const int block_size = BLOCK;
+    const int num_blocks = get_number_of_blocks(size, block_size);
+    if (a != LOGISTIC && a != TANH) {
+        printf(" add_3_arrays_activate() doesn't support activation %d, it supports only LOGISTIC and TANH \n", a);
+        exit(EXIT_FAILURE);
+    }
+    add_3_arrays_activate_kernel << <num_blocks, block_size, 0, get_cuda_stream() >> >(a1, a2, a3, size, a, dst);
+}
+
+
+__global__ void sum_of_mults_kernel(float *a1, float *a2, float *b1, float *b2, size_t size, float *dst)
+{
+    const int index = blockIdx.x*blockDim.x + threadIdx.x;
+    if (index < size) {
+        dst[index] = a1[index] * a2[index] + b1[index] * b2[index];
+    }
+}
+
+extern "C" void sum_of_mults(float *a1, float *a2, float *b1, float *b2,  size_t size, float *dst)
+{
+    const int block_size = BLOCK;
+    const int num_blocks = get_number_of_blocks(size, block_size);
+    sum_of_mults_kernel << <num_blocks, block_size, 0, get_cuda_stream() >> >(a1, a2, b1, b2, size, dst);
+}
+
+
+__global__ void activate_and_mult_kernel(float *a1, float *a2, size_t size, ACTIVATION a, float *dst)
+{
+    const int index = blockIdx.x*blockDim.x + threadIdx.x;
+    if (index < size) {
+        float val = a1[index];
+        if (a == TANH) val = (2 / (1 + expf(-2 * val)) - 1);
+        dst[index] = val * a2[index];
+    }
+}
+
+extern "C" void activate_and_mult(float *a1, float *a2, size_t size, ACTIVATION a, float *dst)
+{
+    const int block_size = BLOCK;
+    const int num_blocks = get_number_of_blocks(size, block_size);
+    if (a != TANH) {
+        printf(" activat_and_mult() doesn't support activation %d, it supports only TANH \n", a);
+        exit(EXIT_FAILURE);
+    }
+    activate_and_mult_kernel << <num_blocks, block_size, 0, get_cuda_stream() >> >(a1, a2, size, a, dst);
+}
+
+
+
+__global__ void scale_channels_kernel(float *in_w_h_c, int size, int channel_size, float *scales_c, float *out)
+{
+    const int index = blockIdx.x*blockDim.x + threadIdx.x;
+    if (index < size) {
+        out[index] = in_w_h_c[index] * scales_c[index / channel_size];
+    }
+}
+
+extern "C" void scale_channels_gpu(float *in_w_h_c, int size, int channel_size, float *scales_c, float *out)
+{
+    const int block_size = BLOCK;
+    const int num_blocks = get_number_of_blocks(size, block_size);
+    scale_channels_kernel << <num_blocks, block_size, 0, get_cuda_stream() >> >(in_w_h_c, size, channel_size, scales_c, out);
+    CHECK_CUDA(cudaPeekAtLastError());
+}
+
+
+__global__ void backward_scale_channels_kernel(float *in_w_h_c_delta, int size, int channel_size,
+    float *in_scales_c, float *out_from_delta,
+    float *in_from_output, float *out_state_delta)
+{
+    const int index = blockIdx.x*blockDim.x + threadIdx.x;
+    if (index < size) {
+        out_state_delta[index / channel_size] += in_w_h_c_delta[index] * in_from_output[index]; // l.delta * from  (should be divided by channel_size?)
+        out_from_delta[index] += in_scales_c[index / channel_size] * in_w_h_c_delta[index]; // input * l.delta
+
+        //out_state_delta[index / channel_size] += in_w_h_c_delta[index] / channel_size;
+        //out_from_delta[index] = in_w_h_c_delta[index];
+    }
+}
+
+extern "C" void backward_scale_channels_gpu(float *in_w_h_c_delta, int size, int channel_size,
+    float *in_scales_c, float *out_from_delta,
+    float *in_from_output, float *out_state_delta)
+{
+    const int block_size = BLOCK;
+    const int num_blocks = get_number_of_blocks(size, block_size);
+    backward_scale_channels_kernel << <num_blocks, block_size, 0, get_cuda_stream() >> > (in_w_h_c_delta, size, channel_size,
+        in_scales_c, out_from_delta,
+        in_from_output, out_state_delta);
+
+    CHECK_CUDA(cudaPeekAtLastError());
 }
